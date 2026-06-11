@@ -27,7 +27,7 @@ from .core.passive_group_capture import is_plugin_enabled_for_session
 from .core.passive_group_capture import is_session_enabled
 from .core.passive_group_capture import set_active_plugin
 from .core.plugin_initializer import PluginInitializer
-from .core.tools import MemoryMemorizeTool, MemorySearchTool
+from .core.tools import MemoryMemorizeTool, MemorySearchTool, MemoryForgetTool
 
 _MIN_ASTRBOT_VERSION = "4.24.2"
 _ASTRBOT_DISTRIBUTION_NAMES = ("AstrBot", "astrbot")
