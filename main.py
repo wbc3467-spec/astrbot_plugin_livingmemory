@@ -247,7 +247,13 @@ class LivingMemoryPlugin(Star):
                     memory_processor=self.initializer.memory_processor,
                 )
             )
-
+        if self.config_manager.get("agent_tools.enable_forget_tool", False):
+            tools.append(
+                MemoryForgetTool(
+                    context=self.context,
+                    memory_engine=self.initializer.memory_engine,
+                )
+            )
         if tools:
             self.context.add_llm_tools(*tools)
         # 标记注册流程完成，后续不再重复检查。
