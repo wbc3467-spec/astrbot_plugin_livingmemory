@@ -64,6 +64,36 @@ class MemoryRecall:
         """Query and inject long-term memory before LLM request"""
         try:
             session_id = event.unified_msg_origin
+
+            # 检测 Mindcraft 系统消息：提取 goal/system 字段作为记忆检索关键词
+            if event.get_extra("_is_mindcraft_system", False):
+                logger.info(f"[{session_id}] 检测到 Mindcraft 系统消息，提取 goal/system 检索记忆")
+                query_for_search = await self._extract_mindcraft_goal_system(
+                    event, req
+                )
+                if query_for_search:
+                    logger.info(
+                        f"[{session_id}] Mindcraft 检索关键词: {query_for_search[:120]}"
+                    )
+                    await self._execute_memory_search_and_inject(
+                        event, req, session_id, query_for_search
+                    )
+                return
+
+            # 按对话标记优先：API 传参可覆盖全局配置
+            skip_memory_inject = event.get_extra("_skip_memory_inject", None)
+            if skip_memory_inject is True:
+                logger.debug("检测到 _skip_memory_inject=true 标记，跳过本轮记忆召回")
+                return
+            if skip_memory_inject is False:
+                logger.debug("检测到 _skip_memory_inject=false 标记，强制注入本轮记忆")
+            else:
+                # API 未传参，使用全局配置
+                if not self.config_manager.get("recall_engine.enable_auto_inject", True):
+                    logger.debug("自动记忆注入已关闭，跳过记忆召回")
+                    return
+
+            session_id = event.unified_msg_origin
             logger.debug(f"[DEBUG-Recall] 获取到 unified_msg_origin: {session_id}")
 
             # 检测异常session_id
@@ -385,3 +415,106 @@ class MemoryRecall:
             pass
 
         return removed
+
+    async def _extract_mindcraft_goal_system(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> str:
+        """从 Mindcraft 系统消息中提取 goal 和 system 字段作为检索关键词"""
+        import re
+
+        prompt_text = getattr(req, "prompt", "")
+        if not isinstance(prompt_text, str):
+            prompt_text = ""
+
+        text = prompt_text
+
+        # 提取 Goal:
+        # 格式1: [Goal] YOUR CURRENT ASSIGNED GOAL: "..."
+        # 格式2: [System] You are self-prompting with the goal: '...'
+        goal = ""
+        goal_match = re.search(r"\[Goal\].*?\"([^\"]+)\"", text)
+        if goal_match:
+            goal = goal_match.group(1).strip()
+        if not goal:
+            goal_match = re.search(r"self-prompting with the goal: '([^']+)'", text)
+            if goal_match:
+                goal = goal_match.group(1).strip()
+
+        # 提取 System: [System] 后面的全部内容（多行）
+        system_match = re.search(r"\[System\]\s*([\s\S]+?)(?=\n\[|\n?$)", text)
+        system = system_match.group(1).strip() if system_match else ""
+
+        # 组合为检索查询
+        parts = []
+        if goal:
+            parts.append(f"goal: {goal}")
+        if system:
+            parts.append(f"system: {system}")
+        if goal:
+            parts.append(goal)
+
+        return " | ".join(parts) if parts else ""
+
+    async def _execute_memory_search_and_inject(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        session_id: str,
+        query: str,
+    ):
+        """用指定 query 检索记忆并注入"""
+        if not query:
+            logger.debug(f"[{session_id}] Mindcraft 系统消息无有效检索关键词，跳过")
+            return
+
+        # 获取过滤配置
+        filtering_config = self.config_manager.filtering_settings
+        use_persona_filtering = filtering_config.get("use_persona_filtering", True)
+        use_session_filtering = filtering_config.get("use_session_filtering", True)
+
+        persona_id = await get_persona_id(self.context, event)
+
+        recall_session_id = session_id if use_session_filtering else None
+        recall_persona_id = persona_id if use_persona_filtering else None
+
+        # 执行记忆检索
+        recalled_memories = await self.memory_engine.search_memories(
+            query=query,
+            k=self.config_manager.get("recall_engine.top_k", 5),
+            session_id=recall_session_id,
+            persona_id=recall_persona_id,
+        )
+
+        if not recalled_memories:
+            logger.info(f"[{session_id}] Mindcraft 检索未找到相关记忆")
+            return
+
+        logger.info(
+            f"[{session_id}] Mindcraft 检索到 {len(recalled_memories)} 条相关记忆")
+
+        # 输出详细记忆信息（与正常流程一致）
+        for idx, mem in enumerate(recalled_memories, 1):
+            logger.debug(
+                f"[{session_id}] [Mindcraft] 记忆 #" + str(idx) + ": 得分=" + f"{mem.final_score:.3f}, " +
+                f"重要性={mem.metadata.get('importance', 0.5):.2f}, " +
+                f"内容={mem.content[:100]}..."
+            )
+
+        memory_list = [
+            {
+                "id": getattr(mem, "doc_id", None),
+                "content": mem.content,
+                "score": mem.final_score,
+                "metadata": mem.metadata,
+                "timestamp": mem.metadata.get("create_time"),
+            }
+            for mem in recalled_memories
+        ]
+
+        memory_str = format_memories_for_injection(memory_list)
+        req.extra_user_content_parts.append(
+            TextPart(text=memory_str).mark_as_temp()
+        )
+        logger.info(
+            f"[{session_id}] Mindcraft 系统消息已注入 {len(recalled_memories)} 条相关记忆"
+        )
